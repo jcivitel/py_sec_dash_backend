@@ -1,46 +1,43 @@
-# Sectacho - CrowdSec Data Analysis Backend
+# Sec-Dash-Backend - CrowdSec Data Analysis Dashboard
 
-Eine Python FastAPI-basierte Backend-Lösung zur Verwaltung, Analyse und Visualisierung von CrowdSec-Sicherheitsdaten.
+A Python FastAPI-based backend solution for managing, analyzing, and visualizing CrowdSec security data with real-time decision streaming and geographic threat intelligence.
 
 ## Features
 
-- 🔐 **CrowdSec Integration**: Direkte Anbindung an CrowdSec API für Echtzeitwarnungen
-- 📊 **Datenanalyse**: Statistiken über Angriffe, Top-IPs und Szenarien
-- 🌍 **GeoIP-Lokalisierung**: Geografische Lokalisierung von Angriffsquellen
-- 🗄️ **PostgreSQL**: Robuste relationale Datenbank für Datenspeicherung
-- 🔒 **API-Authentifizierung**: API-Key basierte Sicherheit
-- ⚡ **Asynchron**: Vollständig asynchrone Verarbeitung mit FastAPI
-- 📈 **REST API**: Moderne REST-Schnittstellen für Frontend-Integration
+- 🔐 **CrowdSec Integration**: Real-time decision streaming and API integration for security alerts
+- 📊 **Data Analysis**: Comprehensive statistics on attacks, top-attacking IPs, and attack scenarios
+- 🌍 **GeoIP Intelligence**: Geographic localization of attack sources with country-level insights
+- 🗄️ **Redis Caching**: High-performance in-memory caching for optimized data retrieval
+- 🔒 **API Security**: API-Key based authentication with rate limiting
+- ⚡ **Async-First**: Fully asynchronous processing with FastAPI and httpx
+- 📈 **REST API**: Modern REST endpoints for frontend integration
+- 🌐 **CORS Support**: Cross-origin resource sharing for frontend applications
 
-## Projektstruktur
+## Project Structure
 
 ```
-py_sectacho/
+py_sec_dash_backend/
 ├── app/
 │   ├── __init__.py
-│   ├── config.py              # Konfiguration und Umgebungsvariablen
-│   ├── database.py            # SQLAlchemy Setup
-│   ├── models.py              # Datenmodelle (Alert, Remediation, etc.)
-│   ├── schemas.py             # Pydantic Schemas für Request/Response
-│   ├── auth.py                # API-Key Authentifizierung
-│   ├── crowdsec_client.py     # CrowdSec API Client
-│   ├── utils.py               # Utility-Funktionen (GeoIP, etc.)
+│   ├── config.py              # Configuration and environment variables
+│   ├── crowdsec_client.py     # CrowdSec API and stream client
+│   ├── redis_client.py        # Redis caching client
 │   └── api/
 │       ├── __init__.py
-│       ├── health.py          # Health Check Endpunkte
-│       ├── alerts.py          # Alert Management API
-│       └── statistics.py      # Statistik API
-├── alembic/                   # Datenbankmigration (Alembic)
-├── main.py                    # FastAPI Entry Point
-├── .env                       # Umgebungsvariablen (nicht commiten!)
-├── .env.example               # Beispiel .env Datei
-├── requirements.txt           # Python Dependencies
-└── README.md                  # Diese Datei
+│       ├── health.py          # Health check endpoints
+│       ├── alerts.py          # Alert management and statistics API
+│       └── country.py         # Country-level threat intelligence API
+├── main.py                    # FastAPI application entry point
+├── .env                       # Environment variables (do not commit!)
+├── .env.example               # Example .env configuration
+├── requirements.txt           # Python dependencies
+├── LICENSE                    # MIT License
+└── README.md                  # This file
 ```
 
 ## Installation
 
-### 1. Virtuelle Umgebung aktivieren
+### 1. Activate Virtual Environment
 
 ```bash
 # Windows
@@ -50,169 +47,169 @@ venv\Scripts\activate
 source venv/bin/activate
 ```
 
-### 2. Dependencies installieren
+### 2. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Oder einzeln:
+Or install individually:
 ```bash
-pip install fastapi uvicorn httpx sqlalchemy psycopg2-binary python-dotenv pydantic python-jose passlib python-multipart slowapi geoip2
+pip install fastapi uvicorn httpx python-dotenv slowapi redis
 ```
 
-### 3. PostgreSQL Datenbank einrichten
+### 3. Configure Environment Variables
 
-Stelle sicher, dass PostgreSQL läuft und erstelle die Datenbank:
-
-```sql
-CREATE DATABASE sectacho;
-```
-
-### 4. Umgebungsvariablen konfigurieren
-
-Kopiere `.env.example` zu `.env` und konfiguriere:
+Copy `.env.example` to `.env` and configure:
 
 ```bash
 cp .env.example .env
 ```
 
-**Wichtige Variablen:**
-- `DATABASE_HOST`: PostgreSQL Host (default: localhost)
-- `DATABASE_PORT`: PostgreSQL Port (default: 5432)
-- `DATABASE_NAME`: Datenbankname (default: sectacho)
-- `DATABASE_USER`: PostgreSQL Benutzer
-- `DATABASE_PASSWORD`: PostgreSQL Passwort
-- `CROWDSEC_HOST`: CrowdSec API URL (z.B. http://localhost:8080)
-- `CROWDSEC_API_KEY`: CrowdSec API Key für Authentifizierung
-- `SECRET_KEY`: Geheimer Schlüssel für Token-Signierung
-- `API_PORT`: Port für FastAPI Server (default: 8000)
+**Required Variables:**
+- `CROWDSEC_HOST`: CrowdSec API URL (e.g., http://localhost:8080)
+- `CROWDSEC_API_KEY`: API key for CrowdSec authentication
+- `API_PORT`: Port for FastAPI server (default: 8000)
+- `API_KEY`: API key for backend authentication (default: generated)
+- `REDIS_HOST`: Redis host for caching (default: localhost)
+- `REDIS_PORT`: Redis port (default: 6379)
+- `REDIS_DB`: Redis database number (default: 0)
 
-### 5. Datenbanktabellen initialisieren
-
-```bash
-python -c "from app.database import init_db; import asyncio; asyncio.run(init_db())"
-```
-
-### 6. Server starten
+### 4. Start the Server
 
 ```bash
 python main.py
 ```
 
-Server läuft dann unter: **http://localhost:8000**
+Server runs at: **http://localhost:8000**
 
 API Documentation: **http://localhost:8000/docs**
 
-## API Endpunkte
+## API Endpoints
+
+All endpoints are available at `http://localhost:8000`
 
 ### Health Check
-- `GET /api/v1/health` - Service Status
-- `GET /api/v1/health/db` - Datenbank Status
+- `GET /health` - Service health status
+- `GET /health/redis` - Redis connectivity check
 
-### Alerts
-- `GET /api/v1/alerts` - Alle Warnungen abrufen
-  - Query Parameter: `skip`, `limit`, `ip`, `severity`
-- `GET /api/v1/alerts/{alert_id}` - Einzelne Warnung
-- `POST /api/v1/alerts/refresh` - Warnungen von CrowdSec aktualisieren
-- `GET /api/v1/alerts/stats/hourly` - Statistiken der letzten 24 Stunden
+### Decisions & Alerts
+- `GET /decisions` - Get the latest decisions from CrowdSec stream listener
+  - Returns: Latest decisions stored in Redis with full decision data
 
-### Statistiken
-- `GET /api/v1/statistics/summary` - Zusammenfassung aller Warnungen
-- `GET /api/v1/statistics/top-ips` - Top Angriffs-IPs
-- `GET /api/v1/statistics/top-scenarios` - Häufigste Angriff Szenarien
-- `GET /api/v1/statistics/daily` - Tägliche Statistiken
+### Country Intelligence
+- `GET /country` - Get country-level threat data
+  - Returns: Decision counts and attack statistics grouped by country
 
-## Authentifizierung
+## CrowdSec Integration
 
-Sende den API-Key im Header:
-```bash
-curl -H "X-API-Key: your_api_key" http://localhost:8000/api/v1/alerts
-```
+This backend integrates with CrowdSec in two ways:
 
-## GeoIP Datenbank
+### 1. REST API Client
+Fetches alert and decision data from CrowdSec API endpoints.
 
-Für GeoIP-Lokalisierung wird die kostenlose GeoLite2-City Datenbank von MaxMind verwendet:
+### 2. Real-Time Stream Listener
+Connects to CrowdSec decision stream for real-time updates. The stream listener runs as a background thread and automatically processes incoming decisions.
 
-1. Registriere dich kostenlos: https://www.maxmind.com/en/geolite2
-2. Lade `GeoLite2-City.mmdb` herunter
-3. Platziere die Datei im Projektroot
+**Configuration:**
+- `CROWDSEC_HOST`: Main CrowdSec API endpoint
+- `CROWDSEC_API_KEY`: Authentication key for CrowdSec
 
-## Datenbankmigration mit Alembic
+## Caching Strategy
 
-```bash
-# Migration erstellen
-alembic revision --autogenerate -m "Description"
+The application uses Redis for caching to optimize data retrieval:
 
-# Alle Migrationen anwenden
-alembic upgrade head
+- **Alert summaries**: Cached for 5 minutes
+- **Country statistics**: Cached for 10 minutes
+- **Top data (IPs, scenarios)**: Cached for 15 minutes
 
-# Zu vorheriger Version zurück
-alembic downgrade -1
-```
+Cache is automatically invalidated when new alerts are processed from CrowdSec stream.
 
-## Roadmap (implementiert)
+## Logging
 
-- ✅ Projektsetup mit FastAPI
-- ✅ CrowdSec API Integration mit httpx
-- ✅ PostgreSQL Verbindung mit SQLAlchemy
-- ✅ REST API Endpunkte (/alerts, /statistics)
-- ✅ Datenmodelle und Validierung (Pydantic)
-- ⚙️ API-Key Authentifizierung (vorhanden, noch nicht aktiviert)
-- ⚙️ Rate-Limiting (slowapi installiert, noch nicht im main.py)
-- ⏳ WebSocket für Echtzeit-Updates
-- ⏳ Automatische Datenbank-Backups
-- ⏳ Logging und Monitoring
+Logging is configured using Python's standard logging module. Logs are output to:
+- Console (stdout)
+- Log files (if configured)
 
-## Logs
-
-Logs werden mit Python logging konfiguriert. Für Production:
-```python
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('app.log'),
-        logging.StreamHandler()
-    ]
-)
-```
+Adjust log level in `main.py` by changing the `logging.basicConfig` level.
 
 ## Deployment
 
-### Docker
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0"]
+### Docker Compose (Recommended)
+
+The easiest way to run the entire stack (backend + Redis):
+
+```bash
+# Copy environment variables
+cp .env.example .env
+
+# Edit .env with your CrowdSec settings
+nano .env
+
+# Start all services
+docker-compose up -d
+
+# View logs
+docker-compose logs -f sec-dash-backend
 ```
 
-### mit Gunicorn (Production)
+The backend will be available at `http://localhost:8000` and Redis at `localhost:6379`.
+
+### Docker (Manual)
+
+Build the image:
 ```bash
-pip install gunicorn
-gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app
+docker build -t sec-dash-backend .
 ```
+
+Run with existing Redis:
+```bash
+docker run -p 8000:8000 \
+  -e CROWDSEC_HOST=http://crowdsec:8080 \
+  -e CROWDSEC_API_KEY=your_key \
+  -e REDIS_HOST=redis \
+  -e REDIS_PORT=6379 \
+  sec-dash-backend
+```
+
+### Local Development
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Start Redis (if not running)
+redis-server
+
+# Run the application
+python main.py
+```
+
+Server will be available at `http://localhost:8000`
 
 ## Troubleshooting
 
-### Datenbankverbindung schlägt fehl
-1. PostgreSQL läuft?
-2. `.env` Variablen korrekt?
-3. Datenbankbenutzer hat Permissions?
+### Redis Connection Failed
+1. Is Redis running and accessible at `REDIS_HOST:REDIS_PORT`?
+2. Check firewall rules and network connectivity
 
-### CrowdSec Verbindung schlägt fehl
-1. CrowdSec API läuft? (`CROWDSEC_HOST`)
-2. API-Key gültig? (`CROWDSEC_API_KEY`)
-3. Firewall blockiert Verbindung?
+### CrowdSec Connection Failed
+1. Is CrowdSec API running at `CROWDSEC_HOST`?
+2. Is the `CROWDSEC_API_KEY` valid?
+3. Check network connectivity and firewall settings
 
-## Lizenz
+### Stream Listener Not Receiving Updates
+1. Verify CrowdSec is configured to enable decision stream
+2. Check that `CROWDSEC_API_KEY` has appropriate permissions
+3. Review logs for stream connection errors
+
+## License
 
 MIT
 
 ## Support
 
-Bei Fragen oder Problemen:
-- Öffne ein Issue im Repository
-- Konsultiere die CrowdSec Dokumentation: https://docs.crowdsec.net
+For questions or issues:
+- Open an issue in the repository
+- Consult the CrowdSec documentation: https://docs.crowdsec.net
+- Check FastAPI documentation: https://fastapi.tiangolo.com
