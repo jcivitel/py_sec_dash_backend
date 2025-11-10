@@ -1,37 +1,19 @@
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: sec-dash-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - sec-dash-network
-
   sec-dash-backend:
     build:
       context: .
       dockerfile: Dockerfile
+      tags:
+      - "jcivitell/sec-dash-backend:${CIRCLE_TAG:-notag}"
     container_name: sec-dash-backend
     ports:
       - "8000:8000"
     environment:
       - CROWDSEC_HOST=${CROWDSEC_HOST:-http://localhost:8080}
-      - CROWDSEC_API_KEY=${CROWDSEC_API_KEY:-your_api_key}
       - API_PORT=8000
-      - API_KEY=${API_KEY:-sk-default-key-change-me}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_DB=0
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
     networks:
       - sec-dash-network
@@ -41,11 +23,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-volumes:
-  redis_data:
-    driver: local
-
+      
 networks:
   sec-dash-network:
     driver: bridge
