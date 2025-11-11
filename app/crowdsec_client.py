@@ -131,7 +131,7 @@ class CrowdSecClient:
         logger.info(f"Starting CrowdSec decision stream from {url}")
         headers = self._get_headers()
         while True:
-            if datetime.now() + timedelta(minutes=5) >= datetime.strptime(self.KEY_RENEWAL_AT, "%Y-%m-%dT%H:%M:%S"):
+            if datetime.now() >= datetime.strptime(self.KEY_RENEWAL_AT, "%Y-%m-%dT%H:%M:%S") - timedelta(minutes=5):
                 logger.info("Renewing API key for decision stream")
                 get_apikey()
                 continue
