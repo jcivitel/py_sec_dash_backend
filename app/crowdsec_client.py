@@ -107,18 +107,25 @@ class CrowdSecClient:
         """
 
         def get_apikey():
-            key = self._make_request(
+            response = self._make_request(
                 "POST",
                 f"{self.base_url}/v1/watchers/login",
-                headers,
+                self._get_headers(),
                 data="""{
                     "scenarios": [
                         "ban"
                     ]
-                }"""),
-            self.KEY_RENEWAL_AT = datetime.strptime(key[0].json().get("expire", datetime.now() + timedelta(minutes=10)),
-                                                    "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%dT%H:%M:%S")
-            self.API_KEY = key[0].json().get("token", "")
+                }""")
+            if response is None:
+                logger.error("Failed to obtain API key")
+                return
+            
+            response_data = response.json()
+            self.KEY_RENEWAL_AT = datetime.strptime(
+                response_data.get("expire", (datetime.now() + timedelta(minutes=10)).isoformat()),
+                "%Y-%m-%dT%H:%M:%S%z"
+            ).strftime("%Y-%m-%dT%H:%M:%S")
+            self.API_KEY = response_data.get("token", "")
             logger.info(f"Obtained API key for decision stream: {self.API_KEY}")
 
         url = f"{self.base_url}/v1/alerts?simulated=false&has_active_decision=true&limit=10"
@@ -129,16 +136,16 @@ class CrowdSecClient:
         logger.info(f"API key will be renewed at {self.KEY_RENEWAL_AT}")
 
         logger.info(f"Starting CrowdSec decision stream from {url}")
-        headers = self._get_headers()
         while True:
             if datetime.now() >= datetime.strptime(self.KEY_RENEWAL_AT, "%Y-%m-%dT%H:%M:%S") - timedelta(minutes=5):
                 logger.info("Renewing API key for decision stream")
                 get_apikey()
                 continue
             try:
+                headers = self._get_headers()  # Refresh headers with current API_KEY
                 response = self._make_request(
                     "GET",
-                    url + "",
+                    url,
                     headers
                 )
 
