@@ -1,4 +1,5 @@
 """Alerts API endpoints"""
+
 import logging
 
 from fastapi import APIRouter
@@ -17,7 +18,7 @@ async def cout_country():
         return {"error": "Redis client not initialized"}
 
     try:
-        return  redis_client.get_decisions_by_country()
+        return redis_client.get_decisions_by_country()
     except Exception as e:
         logger.error(f"Error fetching country decisions: {e}")
         return {"error": "Failed to fetch country decisions"}

@@ -1,4 +1,5 @@
 """Alerts API endpoints"""
+
 import logging
 
 from fastapi import APIRouter
@@ -19,14 +20,7 @@ async def get_latest_decisions():
     try:
         redis_client = get_redis_client()
         decisions = redis_client.get_latest_decisions()
-        return {
-            "status": "success",
-            "decision": decisions
-        }
+        return {"status": "success", "decision": decisions}
     except Exception as e:
         logger.error(f"Error fetching decisions: {e}")
-        return {
-            "status": "error",
-            "message": str(e),
-            "decisions": []
-        }
+        return {"status": "error", "message": str(e), "decisions": []}

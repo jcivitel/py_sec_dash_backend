@@ -1,4 +1,5 @@
 """Redis client for storing CrowdSec decisions"""
+
 import json
 import logging
 from typing import List, Dict, Any, Optional
@@ -25,7 +26,7 @@ class RedisClient:
                 port=settings.redis_port,
                 db=settings.redis_db,
                 password=settings.redis_password if settings.redis_password else None,
-                decode_responses=True
+                decode_responses=True,
             )
             # Test connection
             self.redis_client.ping()
@@ -37,10 +38,10 @@ class RedisClient:
     def add_decision(self, decision_data: Dict[str, Any], id: int) -> bool:
         """
         Add a new decision to Redis
-        
+
         Args:
             decision_data: Decision object from CrowdSec API
-            
+
         Returns:
             True if successful, False otherwise
         """
@@ -60,16 +61,20 @@ class RedisClient:
             self.redis_client.expire(DECISIONS_KEY, 20)
 
             # --- Neuer Block: Länderzählung in COUNTRY_KEY pflegen ---
-            country = decision_data.get('cn')
+            country = decision_data.get("cn")
             if country:
                 try:
                     # Erhöhe den Zähler für dieses Länder-Kürzel in der COUNTRY_KEY-Liste
                     self._increment_country_count(country)
                 except Exception as e:
-                    logger.error(f"Failed to increment country count for {country}: {e}")
+                    logger.error(
+                        f"Failed to increment country count for {country}: {e}"
+                    )
             # --- Ende Länderzählung ---
 
-            logger.debug(f"Added decision for IP {decision_data.get('value', 'unknown')}")
+            logger.debug(
+                f"Added decision for IP {decision_data.get('value', 'unknown')}"
+            )
             return True
 
         except Exception as e:
@@ -112,10 +117,10 @@ class RedisClient:
     def get_latest_decisions(self, count: int = 20) -> List[Dict[str, Any]]:
         """
         Get the latest decisions from Redis
-        
+
         Args:
             count: Number of decisions to return (default 20)
-            
+
         Returns:
             List of decision objects
         """
@@ -159,7 +164,12 @@ class RedisClient:
         try:
             if not self.redis_client:
                 logger.error("Redis client not initialized")
-                return {"status": "error", "message": "Redis client not initialized", "count": 0, "decisions": []}
+                return {
+                    "status": "error",
+                    "message": "Redis client not initialized",
+                    "count": 0,
+                    "decisions": [],
+                }
 
             # Read aggregated country counts from COUNTRY_KEY list
             entries = self.redis_client.lrange(COUNTRY_KEY, 0, -1)

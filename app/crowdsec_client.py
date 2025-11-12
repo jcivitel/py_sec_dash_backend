@@ -1,4 +1,5 @@
 """CrowdSec API Client with stream listener"""
+
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
@@ -14,12 +15,13 @@ logger = logging.getLogger(__name__)
 
 class CrowdSecClient:
     """Client for interacting with CrowdSec API"""
+
     API_KEY = ""
     KEY_RENEWAL_AT = None
     last_decision_id = None
 
     def __init__(self):
-        self.base_url = settings.crowdsec_host.rstrip('/')
+        self.base_url = settings.crowdsec_host.rstrip("/")
         self.tls_cert = str(settings.tls_cert_path)
         self.tls_key = str(settings.tls_key_path)
         self.tls_ca = str(settings.tls_ca_path)
@@ -40,23 +42,23 @@ class CrowdSecClient:
         return {
             "Content-Type": "application/json",
             "User-Agent": "Sectacho/0.1.0",
-            "Authorization": f"Bearer {self.API_KEY}"
+            "Authorization": f"Bearer {self.API_KEY}",
         }
 
     def _make_request(
-            self,
-            method: str,
-            url: str,
-            headers: Dict[str, str],
-            params: Optional[Dict[str, Any]] = None,
-            json: Optional[Dict[str, Any]] = None,
-            stream: bool = False,
-            timeout: int = 30,
-            data: Optional[str] = None
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        params: Optional[Dict[str, Any]] = None,
+        json: Optional[Dict[str, Any]] = None,
+        stream: bool = False,
+        timeout: int = 30,
+        data: Optional[str] = None,
     ):
         """
         Make synchronous HTTP request using requests library
-        
+
         Args:
             method: HTTP method (GET, POST, DELETE, etc.)
             url: Full URL for the request
@@ -64,7 +66,7 @@ class CrowdSecClient:
             params: Query parameters
             json: JSON payload
             stream: Whether to stream the response
-            
+
         Returns:
             Response object or iterator if streaming
         """
@@ -80,7 +82,7 @@ class CrowdSecClient:
                 json=json,
                 timeout=timeout,
                 stream=stream,
-                data=data
+                data=data,
             )
 
             response.raise_for_status()
@@ -91,12 +93,15 @@ class CrowdSecClient:
             return None
         except RequestException as e:
             logger.error(f"HTTP error during {method} request to {url}: {e}")
-            if hasattr(e, 'response') and e.response is not None:
+            if hasattr(e, "response") and e.response is not None:
                 logger.error(f"Response status: {e.response.status_code}")
             return None
         except Exception as e:
-            logger.error(f"Unexpected error during {method} request: {type(e).__name__}: {e}")
+            logger.error(
+                f"Unexpected error during {method} request: {type(e).__name__}: {e}"
+            )
             import traceback
+
             logger.debug(f"Traceback: {traceback.format_exc()}")
             return None
 
@@ -115,15 +120,18 @@ class CrowdSecClient:
                     "scenarios": [
                         "ban"
                     ]
-                }""")
+                }""",
+            )
             if response is None:
                 logger.error("Failed to obtain API key")
                 return
 
             response_data = response.json()
             self.KEY_RENEWAL_AT = datetime.strptime(
-                response_data.get("expire", (datetime.now() + timedelta(minutes=10)).isoformat()),
-                "%Y-%m-%dT%H:%M:%S%z"
+                response_data.get(
+                    "expire", (datetime.now() + timedelta(minutes=10)).isoformat()
+                ),
+                "%Y-%m-%dT%H:%M:%S%z",
             ).strftime("%Y-%m-%dT%H:%M:%S")
             self.API_KEY = response_data.get("token", "")
             logger.info(f"Obtained API key for decision stream: {self.API_KEY}")
@@ -137,24 +145,31 @@ class CrowdSecClient:
 
         logger.info(f"Starting CrowdSec decision stream from {url}")
         while True:
-            if getattr(self, "_last_renewal_print", None) is None or datetime.now() - self._last_renewal_print >= timedelta(minutes=5):
-                logger.info(f"Renewal in: {datetime.strptime(self.KEY_RENEWAL_AT, '%Y-%m-%dT%H:%M:%S') - timedelta(minutes=5) - datetime.now()}")
+            if getattr(
+                self, "_last_renewal_print", None
+            ) is None or datetime.now() - self._last_renewal_print >= timedelta(
+                minutes=5
+            ):
+                logger.info(
+                    f"Renewal in: {datetime.strptime(self.KEY_RENEWAL_AT, '%Y-%m-%dT%H:%M:%S') - timedelta(minutes=5) - datetime.now()}"
+                )
                 self._last_renewal_print = datetime.now()
-            if datetime.now() >= datetime.strptime(self.KEY_RENEWAL_AT, "%Y-%m-%dT%H:%M:%S") - timedelta(minutes=5):
+            if datetime.now() >= datetime.strptime(
+                self.KEY_RENEWAL_AT, "%Y-%m-%dT%H:%M:%S"
+            ) - timedelta(minutes=5):
                 logger.info("Renewing API key for decision stream")
                 get_apikey()
                 continue
             try:
                 headers = self._get_headers()  # Refresh headers with current API_KEY
-                response = self._make_request(
-                    "GET",
-                    url,
-                    headers
-                )
+                response = self._make_request("GET", url, headers)
 
                 if response is None:
-                    logger.error("Failed to connect to decisions stream, retrying in 5 seconds...")
+                    logger.error(
+                        "Failed to connect to decisions stream, retrying in 5 seconds..."
+                    )
                     import time
+
                     time.sleep(5)
                     continue
                 json_data = response.json()
@@ -169,12 +184,13 @@ class CrowdSecClient:
                     logger.info("Added new decision")
                 else:
                     import time
-                    time.sleep(1.25)
 
+                    time.sleep(1.25)
 
             except Exception as e:
                 logger.error(f"Error in decision stream: {type(e).__name__}: {e}")
                 import time
+
                 time.sleep(5)
 
 
