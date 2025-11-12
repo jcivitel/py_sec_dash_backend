@@ -119,7 +119,7 @@ class CrowdSecClient:
             if response is None:
                 logger.error("Failed to obtain API key")
                 return
-            
+
             response_data = response.json()
             self.KEY_RENEWAL_AT = datetime.strptime(
                 response_data.get("expire", (datetime.now() + timedelta(minutes=10)).isoformat()),
@@ -137,6 +137,9 @@ class CrowdSecClient:
 
         logger.info(f"Starting CrowdSec decision stream from {url}")
         while True:
+            if getattr(self, "_last_renewal_print", None) is None or datetime.now() - self._last_renewal_print >= timedelta(minutes=5):
+                logger.info(f"Renewal in: {datetime.strptime(self.KEY_RENEWAL_AT, '%Y-%m-%dT%H:%M:%S') - timedelta(minutes=5) - datetime.now()}")
+                self._last_renewal_print = datetime.now()
             if datetime.now() >= datetime.strptime(self.KEY_RENEWAL_AT, "%Y-%m-%dT%H:%M:%S") - timedelta(minutes=5):
                 logger.info("Renewing API key for decision stream")
                 get_apikey()
