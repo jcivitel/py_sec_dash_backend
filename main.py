@@ -12,11 +12,24 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from dotenv import load_dotenv
 import os
+import time
+
+# Import settings for timezone
+from app.config import settings
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging
+# Set process timezone from settings (default Europe/Berlin). On Unix, time.tzset() will update
+# the C library timezone used by time.localtime() / logging.Formatter's %(asctime)s.
+os.environ.setdefault("TZ", settings.timezone)
+try:
+    time.tzset()
+except Exception:
+    # Windows does not support tzset; zoneinfo will be used for datetime operations
+    pass
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )

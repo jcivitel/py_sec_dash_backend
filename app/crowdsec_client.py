@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
+from datetime import datetime as _datetime_type
 
 import requests
 from requests.exceptions import RequestException, Timeout
@@ -16,9 +17,9 @@ logger = logging.getLogger(__name__)
 class CrowdSecClient:
     """Client for interacting with CrowdSec API"""
 
-    API_KEY = ""
-    KEY_RENEWAL_AT = None
-    last_decision_id = None
+    API_KEY: str = ""
+    KEY_RENEWAL_AT: Optional[_datetime_type] = None
+    last_decision_id: Optional[str] = None
 
     def __init__(self):
         self.base_url = settings.crowdsec_host.rstrip("/")
@@ -127,12 +128,22 @@ class CrowdSecClient:
                 return
 
             response_data = response.json()
-            self.KEY_RENEWAL_AT = datetime.strptime(
-                response_data.get(
-                    "expire", (datetime.now() + timedelta(minutes=10)).isoformat()
-                ),
-                "%Y-%m-%dT%H:%M:%S%z",
-            ).strftime("%Y-%m-%dT%H:%M:%S")
+            # Parse expire time in a timezone-aware manner; if missing, set to now + 10min
+            expire_raw = response_data.get(
+                "expire", (datetime.now(settings.tz) + timedelta(minutes=10)).isoformat()
+            )
+            try:
+                # Try parsing with timezone info
+                expire_dt = datetime.fromisoformat(expire_raw)
+            except Exception:
+                # Fallback: parse without tz and attach configured tz
+                try:
+                    expire_dt = datetime.strptime(expire_raw, "%Y-%m-%dT%H:%M:%S")
+                    expire_dt = expire_dt.replace(tzinfo=settings.tz)
+                except Exception:
+                    expire_dt = datetime.now(settings.tz) + timedelta(minutes=10)
+
+            self.KEY_RENEWAL_AT = expire_dt.astimezone(settings.tz).replace(microsecond=0)
             self.API_KEY = response_data.get("token", "")
             logger.info(f"Obtained API key for decision stream: {self.API_KEY}")
 
@@ -141,22 +152,18 @@ class CrowdSecClient:
         redis_client = get_redis_client()
 
         get_apikey()
-        logger.info(f"API key will be renewed at {self.KEY_RENEWAL_AT}")
+        logger.info(f"API key will be renewed at {self.KEY_RENEWAL_AT.isoformat()}")
 
         logger.info(f"Starting CrowdSec decision stream from {url}")
         while True:
-            if getattr(
-                self, "_last_renewal_print", None
-            ) is None or datetime.now() - self._last_renewal_print >= timedelta(
+            now = datetime.now(settings.tz)
+            if getattr(self, "_last_renewal_print", None) is None or now - self._last_renewal_print >= timedelta(
                 minutes=5
             ):
-                logger.info(
-                    f"Renewal in: {datetime.strptime(self.KEY_RENEWAL_AT, '%Y-%m-%dT%H:%M:%S') - timedelta(minutes=5) - datetime.now()}"
-                )
-                self._last_renewal_print = datetime.now()
-            if datetime.now() >= datetime.strptime(
-                self.KEY_RENEWAL_AT, "%Y-%m-%dT%H:%M:%S"
-            ) - timedelta(minutes=5):
+                renewal_in = self.KEY_RENEWAL_AT - timedelta(minutes=5) - now
+                logger.info(f"Renewal in: {renewal_in}")
+                self._last_renewal_print = now
+            if now >= (self.KEY_RENEWAL_AT - timedelta(minutes=5)):
                 logger.info("Renewing API key for decision stream")
                 get_apikey()
                 continue

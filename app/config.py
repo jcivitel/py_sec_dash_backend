@@ -7,6 +7,9 @@ from pydantic_settings import BaseSettings
 from pydantic import Field
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import timezone as _utc_timezone
+import logging
 
 
 class Settings(BaseSettings):
@@ -38,6 +41,9 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
+
+    # Timezone (default Europe/Berlin)
+    timezone: str = Field(default="Europe/Berlin", alias="TIMEZONE")
 
     class Config:
         env_file = ".env"
@@ -74,6 +80,28 @@ class Settings(BaseSettings):
         if not path.is_absolute():
             path = Path(__file__).parent.parent / path
         return path.resolve()
+
+    @property
+    def tz(self) -> ZoneInfo:
+        """Return a zoneinfo.ZoneInfo instance for the configured timezone.
+
+        Falls back to UTC if the configured timezone is invalid.
+        """
+        try:
+            return ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError:
+            logging.getLogger(__name__).warning(
+                "Timezone data not available for '%s', falling back to UTC." % (self.timezone,)
+            )
+            # Return a ZoneInfo-compatible object; using UTC timezone
+            # Note: datetime.timezone.utc is not a ZoneInfo instance but is usable
+            # with datetime operations for timezone-aware times.
+            return _utc_timezone.utc
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Unexpected error loading timezone '%s', falling back to UTC." % (self.timezone,)
+            )
+            return _utc_timezone.utc
 
     def validate_tls_certificates(self):
         """Validate that TLS certificate files exist and are readable"""
