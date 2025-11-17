@@ -180,7 +180,7 @@ class RedisClient:
 
         except Exception as e:
             logger.error(f"Error aggregating decisions by country: {e}")
-            return {"status": "error", "message": str(e), "count": 0, "decisions": []}
+            return {"status": "error", "message": "An internal error occurred", "count": 0, "decisions": []}
 
 
 # Global Redis client instance
