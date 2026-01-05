@@ -11,8 +11,10 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # Redis keys
-DECISIONS_KEY = "crowdsec:decisions"
-COUNTRY_KEY = "crowdsec:country"
+DECISIONS_HASH_KEY = "crowdsec:decisions:hash"  # Hash für einzelne Decisions mit eindeutiger ID (20s TTL)
+COUNTRY_HASH_KEY = "crowdsec:country:counts"    # Hash für Länderzählungen (24h TTL)
+TOTAL_ATTACKS_KEY = "crowdsec:total:attacks"    # Counter für alle Angriffe (persistent, kein TTL)
+UNIQUE_COUNTRIES_SET_KEY = "crowdsec:unique:countries"  # Set aller Länder (persistent, kein TTL)
 
 
 class RedisClient:
@@ -35,12 +37,13 @@ class RedisClient:
             logger.error(f"Failed to connect to Redis: {e}")
             self.redis_client = None
 
-    def add_decision(self, decision_data: Dict[str, Any], id: int) -> bool:
+    def add_decision(self, decision_data: Dict[str, Any], decision_id: str) -> bool:
         """
-        Add a new decision to Redis
+        Add a new decision to Redis with a unique ID.
 
         Args:
             decision_data: Decision object from CrowdSec API
+            decision_id: Unique identifier for this decision (from CrowdSec)
 
         Returns:
             True if successful, False otherwise
@@ -50,30 +53,35 @@ class RedisClient:
                 logger.error("Redis client not initialized")
                 return False
 
-            # Create entry with timestamp
-            entry = {
-                id: decision_data,
-            }
+            # Store decision in hash with unique ID as field
+            self.redis_client.hset(
+                DECISIONS_HASH_KEY,
+                decision_id,
+                json.dumps(decision_data)
+            )
+            
+            # Set expiration to 20 seconds for the entire hash
+            self.redis_client.expire(DECISIONS_HASH_KEY, 20)
 
-            # Push to list (left push = newest first)
-            self.redis_client.lpush(DECISIONS_KEY, json.dumps(entry))
-            # Set expiration to 20 seconds
-            self.redis_client.expire(DECISIONS_KEY, 20)
+            # Update persistent counter for total attacks (only count new decisions)
+            try:
+                self._increment_total_attacks()
+            except Exception as e:
+                logger.error(f"Failed to increment total attacks counter: {e}")
 
-            # --- Neuer Block: Länderzählung in COUNTRY_KEY pflegen ---
+            # Update country counts and unique countries set
             country = decision_data.get("cn")
             if country:
                 try:
-                    # Erhöhe den Zähler für dieses Länder-Kürzel in der COUNTRY_KEY-Liste
                     self._increment_country_count(country)
+                    self._add_unique_country(country)
                 except Exception as e:
                     logger.error(
-                        f"Failed to increment country count for {country}: {e}"
+                        f"Failed to update country data for {country}: {e}"
                     )
-            # --- Ende Länderzählung ---
 
             logger.debug(
-                f"Added decision for IP {decision_data.get('value', 'unknown')}"
+                f"Added decision with ID {decision_id} for country {decision_data.get('cn', 'unknown')}"
             )
             return True
 
@@ -81,70 +89,110 @@ class RedisClient:
             logger.error(f"Error adding decision to Redis: {e}")
             return False
 
-    def _increment_country_count(self, country: str) -> None:
+    def _increment_total_attacks(self) -> None:
         """
-        Private helper to increment the count for a country code stored in a Redis list (COUNTRY_KEY).
-
+        Increment the persistent counter for total attacks.
+        
         Implementation detail:
-        - The COUNTRY_KEY list contains JSON objects like {"US": 5}, each element representing one country.
-        - We scan the list for an entry that contains the country key, increment it with LSET, or RPUSH a new entry if not found.
+        - Uses Redis STRING to store counter: TOTAL_ATTACKS_KEY = integer count
+        - **NO TTL** - counter persists indefinitely
+        - Increments by 1 for each new decision
         """
         if not self.redis_client:
             raise RuntimeError("Redis client not initialized")
 
-        # Get all country entries
-        entries = self.redis_client.lrange(COUNTRY_KEY, 0, -1)
+        # Increment the persistent counter
+        self.redis_client.incr(TOTAL_ATTACKS_KEY)
+        logger.debug(f"Total attacks counter incremented")
 
-        for idx, item_json in enumerate(entries):
-            try:
-                obj = json.loads(item_json)
-            except Exception:
-                # Skip malformed entries
-                continue
+    def _add_unique_country(self, country: str) -> None:
+        """
+        Add country code to the set of unique countries.
+        
+        Implementation detail:
+        - Uses Redis SET to store unique countries
+        - **NO TTL** - set persists indefinitely
+        - Automatically handles duplicates (set property)
+        """
+        if not self.redis_client:
+            raise RuntimeError("Redis client not initialized")
 
-            if country in obj:
-                # Increment and replace this list element
-                obj[country] = int(obj.get(country, 0)) + 1
-                self.redis_client.lset(COUNTRY_KEY, idx, json.dumps(obj))
-                # Refresh expiration (optional): 1 hour
-                self.redis_client.expire(COUNTRY_KEY, 86400)
-                return
+        # Add country to set (duplicates are ignored)
+        self.redis_client.sadd(UNIQUE_COUNTRIES_SET_KEY, country)
+        logger.debug(f"Added country to unique set: {country}")
 
-        # If not found, append a new entry
-        self.redis_client.rpush(COUNTRY_KEY, json.dumps({country: 1}))
-        self.redis_client.expire(COUNTRY_KEY, 86400)
+    def _increment_country_count(self, country: str) -> None:
+        """
+        Increment the count for a country code in the country hash.
+
+        Implementation detail:
+        - Uses Redis HASH to store country counts: field = country code, value = count
+        - Automatically creates entry if not exists
+        - TTL = 24 hours
+        """
+        if not self.redis_client:
+            raise RuntimeError("Redis client not initialized")
+
+        # Increment the counter for this country
+        self.redis_client.hincrby(COUNTRY_HASH_KEY, country, 1)
+        
+        # Set expiration to 24 hours
+        self.redis_client.expire(COUNTRY_HASH_KEY, 86400)
 
     def get_latest_decisions(self, count: int = 20) -> List[Dict[str, Any]]:
         """
-        Get the latest decisions from Redis
+        Get the latest decisions from Redis as array of objects with ID as key.
 
         Args:
             count: Number of decisions to return (default 20)
 
         Returns:
-            List of decision objects
+            List of decision objects in format [{"id": {...}}, {"id2": {...}}]
         """
         try:
             if not self.redis_client:
                 logger.error("Redis client not initialized")
                 return []
 
-            # Get entries from list (0 to count-1)
-            entries = self.redis_client.lrange(DECISIONS_KEY, 0, count - 1)
-            entries_decoded = [json.loads(entry_json) for entry_json in entries]
-            return entries_decoded
+            # Get all decisions from hash
+            all_decisions_dict = self.redis_client.hgetall(DECISIONS_HASH_KEY)  # type: ignore[no-untyped-call]
+            
+            if not all_decisions_dict:
+                return []
+
+            # Convert to list of single-key dicts: [{"id": data}, {"id2": data}, ...]
+            result: List[Dict[str, Any]] = []
+            item_count = 0
+            decisions_items = list(all_decisions_dict.items())  # type: ignore[union-attr]
+            for decision_id, decision_json in decisions_items:
+                if item_count >= count:
+                    break
+                try:
+                    decision_data = json.loads(str(decision_json))
+                    result.append({decision_id: decision_data})
+                    item_count += 1
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse decision {decision_id}")
+                    continue
+            
+            return result
 
         except Exception as e:
             logger.error(f"Error retrieving decisions from Redis: {e}")
             return []
 
     def clear_all(self) -> bool:
-        """Clear all decisions from Redis"""
+        """Clear all data from Redis"""
         try:
             if not self.redis_client:
                 return False
-            self.redis_client.delete(DECISIONS_KEY)
-            logger.info("Cleared all decisions from Redis")
+            self.redis_client.delete(
+                DECISIONS_HASH_KEY,
+                COUNTRY_HASH_KEY,
+                TOTAL_ATTACKS_KEY,
+                UNIQUE_COUNTRIES_SET_KEY
+            )
+            logger.info("Cleared all decisions, country counts, and metrics from Redis")
             return True
         except Exception as e:
             logger.error(f"Error clearing Redis: {e}")
@@ -152,14 +200,11 @@ class RedisClient:
 
     def get_decisions_by_country(self):
         """
-        Aggregate decisions by country (cn) and return counts.
-
-        Args:
-            count: number of latest decisions to scan from Redis (default 100)
+        Get aggregated country counts from Redis hash with metadata.
 
         Returns:
-
-            Dict with status, total count and a list of {"cn": country_code, "count": n}
+            Dict with status, metadata (total_attacks, unique_countries, attacks_per_hour), 
+            and countries list sorted by count (descending)
         """
         try:
             if not self.redis_client:
@@ -167,20 +212,71 @@ class RedisClient:
                 return {
                     "status": "error",
                     "message": "Redis client not initialized",
-                    "count": 0,
-                    "decisions": [],
                 }
 
-            # Read aggregated country counts from COUNTRY_KEY list
-            entries = self.redis_client.lrange(COUNTRY_KEY, 0, -1)
-            # Jeder Eintrag ist ein Byte/String → zu Python-Objekten wandeln
-            decoded_entries = [json.loads(entry) for entry in entries]
+            # Get all country counts from hash
+            country_counts = self.redis_client.hgetall(COUNTRY_HASH_KEY)  # type: ignore[no-untyped-call]
+            
+            # Get persistent metrics
+            total_attacks = 0
+            total_attacks_str = self.redis_client.get(TOTAL_ATTACKS_KEY)  # type: ignore[no-untyped-call]
+            if total_attacks_str:
+                try:
+                    total_attacks = int(str(total_attacks_str))
+                except (ValueError, TypeError):
+                    total_attacks = 0
+            
+            unique_countries = 0
+            unique_countries_set = self.redis_client.smembers(UNIQUE_COUNTRIES_SET_KEY)  # type: ignore[no-untyped-call]
+            if unique_countries_set:
+                try:
+                    unique_countries = len(list(unique_countries_set))  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    unique_countries = 0
+            
+            # Calculate attacks per hour (total / 24)
+            attacks_per_hour = total_attacks // 24 if total_attacks > 0 else 0
+            
+            # Build metadata
+            metadata = {
+                "total_attacks": total_attacks,
+                "unique_countries": unique_countries,
+                "attacks_per_hour": attacks_per_hour,
+            }
+            
+            if not country_counts:
+                return {
+                    "status": "success",
+                    "metadata": metadata,
+                    "countries": []
+                }
 
-            return {"status": "success", "countries": decoded_entries}
+            # Convert to list of {"country_code": count} dicts and sort by count descending
+            countries_list = []
+            items_list = list(country_counts.items())  # type: ignore[union-attr]
+            for country, count_str in items_list:
+                try:
+                    count = int(count_str)
+                    countries_list.append({country: count})
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid count for country {country}: {count_str}")
+                    continue
+            
+            # Sort by count (value) in descending order
+            countries_list.sort(key=lambda x: list(x.values())[0], reverse=True)
+
+            return {
+                "status": "success",
+                "metadata": metadata,
+                "countries": countries_list
+            }
 
         except Exception as e:
             logger.error(f"Error aggregating decisions by country: {e}")
-            return {"status": "error", "message": "An internal error occurred", "count": 0, "decisions": []}
+            return {
+                "status": "error",
+                "message": "An internal error occurred"
+            }
 
 
 # Global Redis client instance

@@ -152,7 +152,8 @@ class CrowdSecClient:
         redis_client = get_redis_client()
 
         get_apikey()
-        logger.info(f"API key will be renewed at {self.KEY_RENEWAL_AT.isoformat()}")
+        if self.KEY_RENEWAL_AT:
+            logger.info(f"API key will be renewed at {self.KEY_RENEWAL_AT.isoformat()}")
 
         logger.info(f"Starting CrowdSec decision stream from {url}")
         while True:
@@ -160,10 +161,11 @@ class CrowdSecClient:
             if getattr(self, "_last_renewal_print", None) is None or now - self._last_renewal_print >= timedelta(
                 minutes=5
             ):
-                renewal_in = self.KEY_RENEWAL_AT - timedelta(minutes=5) - now
-                logger.info(f"Renewal in: {renewal_in}")
+                if self.KEY_RENEWAL_AT:
+                    renewal_in = self.KEY_RENEWAL_AT - timedelta(minutes=5) - now
+                    logger.info(f"Renewal in: {renewal_in}")
                 self._last_renewal_print = now
-            if now >= (self.KEY_RENEWAL_AT - timedelta(minutes=5)):
+            if self.KEY_RENEWAL_AT and now >= (self.KEY_RENEWAL_AT - timedelta(minutes=5)):
                 logger.info("Renewing API key for decision stream")
                 get_apikey()
                 continue
@@ -179,15 +181,20 @@ class CrowdSecClient:
 
                     time.sleep(5)
                     continue
+                
                 json_data = response.json()
                 if not self.last_decision_id == json_data[0]["id"]:
                     self.last_decision_id = json_data[0]["id"]
+                    # Get current timestamp in ISO format
+                    timestamp = datetime.now(settings.tz).isoformat()
                     data = {
                         "latitude": json_data[0]["source"]["latitude"],
                         "longitude": json_data[0]["source"]["longitude"],
                         "cn": json_data[0]["source"]["cn"],
+                        "timestamp": timestamp,
                     }
-                    redis_client.add_decision(data, json_data[0]["id"])
+                    # Use CrowdSec decision ID as unique identifier
+                    redis_client.add_decision(data, str(json_data[0]["id"]))
                     logger.info("Added new decision")
                 else:
                     import time
