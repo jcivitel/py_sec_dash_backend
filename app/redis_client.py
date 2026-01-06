@@ -15,6 +15,7 @@ DECISIONS_HASH_KEY = "crowdsec:decisions:hash"  # Hash für einzelne Decisions m
 COUNTRY_HASH_KEY = "crowdsec:country:counts"    # Hash für Länderzählungen (24h TTL)
 TOTAL_ATTACKS_KEY = "crowdsec:total:attacks"    # Counter für alle Angriffe (persistent, kein TTL)
 UNIQUE_COUNTRIES_SET_KEY = "crowdsec:unique:countries"  # Set aller Länder (persistent, kein TTL)
+DECISIONS_HISTORY_LIST_KEY = "crowdsec:decisions:history"  # Sorted Set für historische Decisions mit Timestamp (7 Tage TTL)
 
 
 class RedisClient:
@@ -79,6 +80,12 @@ class RedisClient:
                     logger.error(
                         f"Failed to update country data for {country}: {e}"
                     )
+
+            # Store decision in history with timestamp for pagination
+            try:
+                self._add_to_history(decision_id, decision_data)
+            except Exception as e:
+                logger.error(f"Failed to add decision to history: {e}")
 
             logger.debug(
                 f"Added decision with ID {decision_id} for country {decision_data.get('cn', 'unknown')}"
@@ -181,6 +188,97 @@ class RedisClient:
             logger.error(f"Error retrieving decisions from Redis: {e}")
             return []
 
+    def _add_to_history(self, decision_id: str, decision_data: Dict[str, Any]) -> None:
+        """
+        Add decision to history sorted set.
+        
+        Implementation detail:
+        - Uses Redis Sorted Set with timestamp as score
+        - Stores decision as JSON with ID as member
+        - TTL = 7 days for history
+        """
+        if not self.redis_client:
+            raise RuntimeError("Redis client not initialized")
+        
+        try:
+            import time
+            timestamp = time.time()  # Current timestamp as score
+            
+            # Add to sorted set with timestamp as score
+            self.redis_client.zadd(
+                DECISIONS_HISTORY_LIST_KEY,
+                {f"{decision_id}:{json.dumps(decision_data)}": timestamp}
+            )
+            
+            # Set expiration to 7 days (604800 seconds)
+            self.redis_client.expire(DECISIONS_HISTORY_LIST_KEY, 604800)
+            logger.debug(f"Added decision {decision_id} to history")
+        except Exception as e:
+            logger.error(f"Failed to add decision to history: {e}")
+            raise
+
+    def get_decision_history(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """
+        Get paginated decision history from Redis sorted set.
+        
+        Args:
+            limit: Number of decisions to return (max 1000)
+            offset: Number of decisions to skip
+        
+        Returns:
+            List of decision objects in format [{"id": {...}}, {"id2": {...}}]
+        """
+        try:
+            if not self.redis_client:
+                logger.error("Redis client not initialized")
+                return []
+            
+            # Clamp limit to reasonable value
+            limit = min(limit, 1000)
+            
+            # Get range from sorted set (reversed to get newest first)
+            # ZREVRANGE returns from highest to lowest score
+            history_items: Any = self.redis_client.zrevrange(  # type: ignore[no-untyped-call]
+                DECISIONS_HISTORY_LIST_KEY,
+                offset,
+                offset + limit - 1,
+                withscores=False
+            )
+            
+            if not history_items:
+                return []
+            
+            result: List[Dict[str, Any]] = []
+            for item in history_items:  # type: ignore[union-attr]
+                try:
+                    # Parse the stored format: "id:json_data"
+                    item_str = str(item)
+                    if ":" in item_str:
+                        decision_id, decision_json = item_str.split(":", 1)
+                        decision_data = json.loads(decision_json)
+                        result.append({decision_id: decision_data})
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"Failed to parse history item: {e}")
+                    continue
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"Error retrieving decision history: {e}")
+            return []
+
+    def get_history_count(self) -> int:
+        """Get total number of decisions in history"""
+        try:
+            if not self.redis_client:
+                return 0
+            
+            count: Any = self.redis_client.zcard(DECISIONS_HISTORY_LIST_KEY)  # type: ignore[no-untyped-call]
+            return int(count) if count else 0
+        except Exception as e:
+            logger.error(f"Error getting history count: {e}")
+            return 0
+
     def clear_all(self) -> bool:
         """Clear all data from Redis"""
         try:
@@ -190,7 +288,8 @@ class RedisClient:
                 DECISIONS_HASH_KEY,
                 COUNTRY_HASH_KEY,
                 TOTAL_ATTACKS_KEY,
-                UNIQUE_COUNTRIES_SET_KEY
+                UNIQUE_COUNTRIES_SET_KEY,
+                DECISIONS_HISTORY_LIST_KEY
             )
             logger.info("Cleared all decisions, country counts, and metrics from Redis")
             return True
