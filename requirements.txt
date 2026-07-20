@@ -4,7 +4,7 @@ colorama==0.4.6
 mypy_extensions==1.1.0
 packaging==25.0
 pathspec==0.12.1
-platformdirs==4.5.0
+platformdirs==4.10.1
 pytokens==0.3.0
 fastapi==0.123.0
 uvicorn==0.38.0
