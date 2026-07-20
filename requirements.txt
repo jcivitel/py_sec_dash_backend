@@ -6,7 +6,7 @@ packaging==26.2
 pathspec==0.12.1
 platformdirs==4.10.1
 pytokens==0.3.0
-fastapi==0.123.0
+fastapi==0.139.2
 uvicorn==0.38.0
 python-dotenv==1.2.1
 pydantic==2.13.4
