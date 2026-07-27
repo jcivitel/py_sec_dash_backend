@@ -5,7 +5,7 @@ mypy_extensions==1.1.0
 packaging==26.2
 pathspec==0.12.1
 platformdirs==4.10.1
-pytokens==0.3.0
+pytokens==0.4.1
 fastapi==0.139.2
 uvicorn==0.38.0
 python-dotenv==1.2.2
