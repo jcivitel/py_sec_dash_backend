@@ -106,3 +106,38 @@ def test_timeline_endpoint(api: TestClient):
     by_hours_ago = {e["hours_ago"]: e["count"] for e in body["timeline"]}
     assert by_hours_ago[0] == 1
     assert by_hours_ago[4] == 1
+
+
+# ------------------------------------------------------- Fehlerbehandlung
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/decisions",
+        "/api/v1/decisions/history",
+        "/api/v1/country",
+        "/api/v1/timeline",
+    ],
+)
+def test_errors_do_not_leak_internals(api: TestClient, monkeypatch, path: str, caplog):
+    """Ausnahmen dürfen nicht im Klartext an den Aufrufer gehen.
+
+    CodeQL "Information exposure through an exception" - die Antwort trug
+    früher `str(e)` und damit Interna nach außen.
+    """
+    secret = "redis://user:hunter2@internal-host:6379 kaputt"
+
+    def boom():
+        raise RuntimeError(secret)
+
+    for module in (alerts, country, stats):
+        monkeypatch.setattr(module, "get_redis_client", boom)
+
+    body = api.get(path).json()
+
+    assert body["status"] == "error"
+    assert secret not in body["message"]
+    assert "hunter2" not in body["message"]
+    # Für die Fehlersuche muss der Grund aber im Log stehen.
+    assert secret in caplog.text

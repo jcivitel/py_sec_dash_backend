@@ -30,8 +30,9 @@ async def get_latest_decisions():
         decisions = redis_client.get_latest_decisions(count=20)
         return {"status": "success", "decision": decisions}
     except Exception as e:
+        # Details bleiben im Log - die Antwort verrät keine Interna.
         logger.error(f"Error fetching decisions: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "Failed to fetch decisions"}
 
 
 @router.get("/decisions/history")
@@ -69,5 +70,6 @@ async def get_decision_history(limit: int = Query(100, ge=1, le=1000), offset: i
             }
         }
     except Exception as e:
+        # Details bleiben im Log - die Antwort verrät keine Interna.
         logger.error(f"Error fetching decision history: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "Failed to fetch decision history"}
