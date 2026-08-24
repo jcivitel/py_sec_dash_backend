@@ -23,12 +23,12 @@ async def get_country_stats():
     
     Results are sorted by count (highest first).
     """
-    redis_client = get_redis_client()
-    if not redis_client:
-        return {"status": "error", "message": "Redis client not initialized"}
-
     try:
+        # Auch die Beschaffung des Clients gehört in den try-Block, sonst
+        # verlässt eine Ausnahme von dort den Handler ungefiltert.
+        redis_client = get_redis_client()
         return redis_client.get_decisions_by_country()
     except Exception as e:
+        # Details bleiben im Log - die Antwort verrät keine Interna.
         logger.error(f"Error fetching country decisions: {e}")
         return {"status": "error", "message": "Failed to fetch country decisions"}

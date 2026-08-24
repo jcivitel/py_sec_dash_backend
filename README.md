@@ -93,13 +93,22 @@ All endpoints are available at `http://localhost:8000`
 - `GET /health` - Service health status
 - `GET /health/redis` - Redis connectivity check
 
+All application endpoints live under `/api/v1`.
+
 ### Decisions & Alerts
-- `GET /decisions` - Get the latest decisions from CrowdSec stream listener
-  - Returns: Latest decisions stored in Redis with full decision data
+- `GET /api/v1/decisions` - Attacks currently running (last 20 seconds)
+- `GET /api/v1/decisions/history?limit=&offset=` - Paginated history over the
+  rolling 24 h window, newest first. `limit` max. 1000.
 
 ### Country Intelligence
-- `GET /country` - Get country-level threat data
-  - Returns: Decision counts and attack statistics grouped by country
+- `GET /api/v1/country` - Attack counts per country over the last 24 h, plus
+  metadata (`total_attacks`, `unique_countries`, `attacks_per_hour`)
+
+### Timeline
+- `GET /api/v1/timeline` - Attacks per hour for the last 24 hours (24 entries,
+  oldest first)
+
+See [API.md](API.md) for full request and response formats.
 
 ## CrowdSec Integration
 
@@ -115,15 +124,44 @@ Connects to CrowdSec decision stream for real-time updates. The stream listener 
 - `CROWDSEC_HOST`: Main CrowdSec API endpoint
 - `CROWDSEC_API_KEY`: Authentication key for CrowdSec
 
-## Caching Strategy
+## Storage Model
 
-The application uses Redis for caching to optimize data retrieval:
+Redis is the only datastore. Every attack is written **once** and expires after
+24 hours; aggregates are maintained on write rather than computed from the raw
+events, so read cost stays constant as data accumulates.
 
-- **Alert summaries**: Cached for 5 minutes
-- **Country statistics**: Cached for 10 minutes
-- **Top data (IPs, scenarios)**: Cached for 15 minutes
+| Key | Type | Contents |
+|-----|------|----------|
+| `sec:attacks` | ZSET | member = decision id, score = unix time (index over the 24 h window) |
+| `sec:attack:{id}` | STRING | JSON payload of one attack, TTL 24 h |
+| `sec:hour:{h}:countries` | ZSET | country code → count for hour `h` |
+| `sec:hour:{h}:total` | STRING | attack count for hour `h` |
+| `sec:countries:24h` | ZSET | 15 s cache of the union over the 24 hourly buckets |
 
-Cache is automatically invalidated when new alerts are processed from CrowdSec stream.
+Hourly buckets expire via `EXPIREAT` 25 hours after their hour ends, so no
+background job is needed. The attack index is trimmed at most once a minute on
+write; payloads clean themselves up through their own TTL.
+
+Writes go out in a single pipeline, so one incoming attack costs one round trip.
+
+## Tests
+
+The test suite runs against a real Redis instance:
+
+```bash
+# Start a throwaway Redis
+docker run -d --rm --name sec_dash_redis_test -p 63790:6379 redis:8-alpine
+
+# Install dev dependencies and run
+pip install -r requirements-dev.txt
+REDIS_HOST=localhost REDIS_PORT=63790 REDIS_DB=15 pytest tests/ -q
+```
+
+`REDIS_DB` is flushed before every test - point it at a scratch database, never
+at the production one.
+
+Alternatively `docker compose -f docker-compose.dev.yml up --build` starts the
+backend together with its own Redis.
 
 ## Logging
 

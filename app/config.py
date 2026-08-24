@@ -3,7 +3,7 @@ Application Configuration
 Loads settings from environment variables
 """
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 import os
 from pathlib import Path
@@ -45,10 +45,12 @@ class Settings(BaseSettings):
     # Timezone (default Europe/Berlin)
     timezone: str = Field(default="Europe/Berlin", alias="TIMEZONE")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
     @property
     def redis_url(self) -> str:

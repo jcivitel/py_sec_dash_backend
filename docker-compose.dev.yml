@@ -1,0 +1,31 @@
+# Lokale Entwicklungsumgebung: Backend plus eigene Redis-Instanz.
+# Die produktive Konfiguration steht in docker-compose.yml.
+#
+#   docker compose -f docker-compose.dev.yml up --build
+
+services:
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "63790:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  sec-dash-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_PASSWORD: ""
+    depends_on:
+      redis:
+        condition: service_healthy

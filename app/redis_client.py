@@ -1,8 +1,35 @@
-"""Redis client for storing CrowdSec decisions"""
+"""Redis-Zugriff für CrowdSec-Decisions.
+
+Datenmodell
+-----------
+Jeder Angriff wird genau einmal gespeichert und verschwindet nach 24 Stunden
+von selbst wieder. Aggregate werden nicht aus den Rohdaten berechnet, sondern
+beim Schreiben in Stundeneimer fortgeschrieben - dadurch bleibt jede Abfrage
+unabhängig von der Menge der gespeicherten Angriffe.
+
+===========================  ======  ==================================================
+Key                          Typ     Inhalt
+===========================  ======  ==================================================
+``sec:attacks``              ZSET    member = Decision-ID, score = Unix-Zeit.
+                                     Der Index über alle Angriffe der letzten 24 h.
+``sec:attack:{id}``          STRING  JSON-Nutzdaten eines Angriffs, TTL 24 h.
+``sec:hour:{h}:countries``   ZSET    member = Ländercode, score = Anzahl in Stunde ``h``.
+``sec:hour:{h}:total``       STRING  Gesamtzahl der Angriffe in Stunde ``h``.
+``sec:countries:24h``        ZSET    Kurzlebiger Cache der Vereinigung der 24 Eimer.
+===========================  ======  ==================================================
+
+``h`` ist die volle Unix-Stunde (``int(timestamp // 3600)``). Die Stundeneimer
+laufen per ``EXPIREAT`` 25 Stunden nach Ende ihrer Stunde ab, sodass immer
+mindestens die letzten 24 vollständigen Stunden vorliegen.
+"""
+
+from __future__ import annotations
 
 import json
 import logging
-from typing import List, Dict, Any, Optional
+import time
+from datetime import datetime
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import redis
 
@@ -10,380 +37,420 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Redis keys
-DECISIONS_HASH_KEY = "crowdsec:decisions:hash"  # Hash für einzelne Decisions mit eindeutiger ID (20s TTL)
-COUNTRY_HASH_KEY = "crowdsec:country:counts"    # Hash für Länderzählungen (24h TTL)
-TOTAL_ATTACKS_KEY = "crowdsec:total:attacks"    # Counter für alle Angriffe (persistent, kein TTL)
-UNIQUE_COUNTRIES_SET_KEY = "crowdsec:unique:countries"  # Set aller Länder (persistent, kein TTL)
-DECISIONS_HISTORY_LIST_KEY = "crowdsec:decisions:history"  # Sorted Set für historische Decisions mit Timestamp (7 Tage TTL)
+# --- Zeitfenster -----------------------------------------------------------
+HOUR = 3600
+WINDOW_HOURS = 24
+TTL_24H = WINDOW_HOURS * HOUR
+#: Stundeneimer leben eine Stunde länger als das Fenster, damit die laufende
+#: Stunde beim Rollover nicht verfrüht wegfällt.
+BUCKET_TTL = TTL_24H + HOUR
+#: Zeitfenster, in dem ein Angriff als "gerade laufend" gilt (Kartenanzeige).
+LIVE_WINDOW = 20
+
+# --- Keys ------------------------------------------------------------------
+ATTACKS_KEY = "sec:attacks"
+ATTACK_PAYLOAD_PREFIX = "sec:attack:"
+HOUR_PREFIX = "sec:hour:"
+COUNTRIES_CACHE_KEY = "sec:countries:24h"
+#: So lange gilt die zwischengespeicherte Ländervereinigung als frisch.
+COUNTRIES_CACHE_TTL = 15
+
+#: Schlüssel aus einer früheren Version, die beim Aufräumen mit entfernt werden.
+LEGACY_KEYS = (
+    "crowdsec:decisions:hash",
+    "crowdsec:decisions:history",
+    "crowdsec:attacks:24h",
+    "crowdsec:countries:24h",
+)
+
+#: Der Index wird höchstens alle 60 s beschnitten - häufiger bringt nichts,
+#: weil alle Abfragen ohnehin nach Zeitfenster filtern.
+TRIM_INTERVAL = 60
+
+
+def _hour_of(timestamp: float) -> int:
+    """Volle Unix-Stunde, in die ein Zeitstempel fällt."""
+    return int(timestamp // HOUR)
+
+
+def _countries_key(hour: int) -> str:
+    return f"{HOUR_PREFIX}{hour}:countries"
+
+
+def _total_key(hour: int) -> str:
+    return f"{HOUR_PREFIX}{hour}:total"
+
+
+def _payload_key(decision_id: str) -> str:
+    return f"{ATTACK_PAYLOAD_PREFIX}{decision_id}"
 
 
 class RedisClient:
-    """Client for Redis operations"""
+    """Kapselt sämtliche Redis-Zugriffe des Backends."""
 
-    def __init__(self):
-        """Initialize Redis connection"""
+    def __init__(self) -> None:
+        self._last_trim = 0.0
+        self.redis_client: Optional[redis.Redis] = self._connect()
+
+    # ------------------------------------------------------------------
+    # Verbindung
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _connect() -> Optional[redis.Redis]:
         try:
-            self.redis_client = redis.Redis(
+            client = redis.Redis(
                 host=settings.redis_host,
                 port=settings.redis_port,
                 db=settings.redis_db,
-                password=settings.redis_password if settings.redis_password else None,
+                password=settings.redis_password or None,
                 decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                # Erkennt stillschweigend abgebrochene Verbindungen und baut sie
+                # neu auf, statt dauerhaft ins Leere zu laufen.
+                health_check_interval=30,
+                retry_on_timeout=True,
             )
-            # Test connection
-            self.redis_client.ping()
-            logger.info("Redis connection established")
-        except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            self.redis_client = None
+            client.ping()
+            logger.info("Redis-Verbindung hergestellt")
+            return client
+        except Exception as exc:
+            logger.error("Redis-Verbindung fehlgeschlagen: %s", exc)
+            return None
 
+    def _client(self) -> Optional[redis.Redis]:
+        """Liefert eine benutzbare Verbindung und versucht bei Bedarf einen Neuaufbau."""
+        if self.redis_client is None:
+            self.redis_client = self._connect()
+        return self.redis_client
+
+    # ------------------------------------------------------------------
+    # Schreibpfad
+    # ------------------------------------------------------------------
     def add_decision(self, decision_data: Dict[str, Any], decision_id: str) -> bool:
+        """Speichert einen Angriff und schreibt die Stundenaggregate fort.
+
+        Alle Schreibvorgänge laufen in einer Pipeline, also in einem einzigen
+        Roundtrip zum Server.
         """
-        Add a new decision to Redis with a unique ID.
-
-        Args:
-            decision_data: Decision object from CrowdSec API
-            decision_id: Unique identifier for this decision (from CrowdSec)
-
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            if not self.redis_client:
-                logger.error("Redis client not initialized")
-                return False
-
-            # Store decision in hash with unique ID as field
-            self.redis_client.hset(
-                DECISIONS_HASH_KEY,
-                decision_id,
-                json.dumps(decision_data)
-            )
-            
-            # Set expiration to 20 seconds for the entire hash
-            self.redis_client.expire(DECISIONS_HASH_KEY, 20)
-
-            # Update persistent counter for total attacks (only count new decisions)
-            try:
-                self._increment_total_attacks()
-            except Exception as e:
-                logger.error(f"Failed to increment total attacks counter: {e}")
-
-            # Update country counts and unique countries set
-            country = decision_data.get("cn")
-            if country:
-                try:
-                    self._increment_country_count(country)
-                    self._add_unique_country(country)
-                except Exception as e:
-                    logger.error(
-                        f"Failed to update country data for {country}: {e}"
-                    )
-
-            # Store decision in history with timestamp for pagination
-            try:
-                self._add_to_history(decision_id, decision_data)
-            except Exception as e:
-                logger.error(f"Failed to add decision to history: {e}")
-
-            logger.debug(
-                f"Added decision with ID {decision_id} for country {decision_data.get('cn', 'unknown')}"
-            )
-            return True
-
-        except Exception as e:
-            logger.error(f"Error adding decision to Redis: {e}")
+        client = self._client()
+        if client is None:
             return False
 
-    def _increment_total_attacks(self) -> None:
-        """
-        Increment the persistent counter for total attacks.
-        
-        Implementation detail:
-        - Uses Redis STRING to store counter: TOTAL_ATTACKS_KEY = integer count
-        - **NO TTL** - counter persists indefinitely
-        - Increments by 1 for each new decision
-        """
-        if not self.redis_client:
-            raise RuntimeError("Redis client not initialized")
+        timestamp = self._timestamp_of(decision_data)
+        hour = _hour_of(timestamp)
+        country = str(decision_data.get("cn") or "unknown").upper()
+        # Festes Ablaufdatum, unabhängig davon, wie oft in die Stunde
+        # geschrieben wird.
+        expire_at = int((hour + 1) * HOUR + BUCKET_TTL)
 
-        # Increment the persistent counter
-        self.redis_client.incr(TOTAL_ATTACKS_KEY)
-        logger.debug(f"Total attacks counter incremented")
+        try:
+            pipe = client.pipeline(transaction=False)
+            pipe.zadd(ATTACKS_KEY, {decision_id: timestamp})
+            pipe.set(_payload_key(decision_id), json.dumps(decision_data), ex=TTL_24H)
+            pipe.zincrby(_countries_key(hour), 1, country)
+            pipe.expireat(_countries_key(hour), expire_at)
+            pipe.incr(_total_key(hour))
+            pipe.expireat(_total_key(hour), expire_at)
+            pipe.execute()
+        except Exception as exc:
+            logger.error("Angriff %s konnte nicht gespeichert werden: %s", decision_id, exc)
+            return False
 
-    def _add_unique_country(self, country: str) -> None:
+        self._trim_if_due()
+        logger.debug("Angriff %s (%s) gespeichert", decision_id, country)
+        return True
+
+    @staticmethod
+    def _timestamp_of(decision_data: Dict[str, Any]) -> float:
+        """Nutzt den Zeitstempel der Decision, sonst die aktuelle Zeit."""
+        raw = decision_data.get("timestamp")
+        if raw:
+            try:
+                return datetime.fromisoformat(str(raw)).timestamp()
+            except ValueError:
+                logger.debug("Unlesbarer Zeitstempel %r, nutze aktuelle Zeit", raw)
+        return time.time()
+
+    def _trim_if_due(self) -> None:
+        """Entfernt Index-Einträge, die aus dem 24-h-Fenster gefallen sind.
+
+        Die Nutzdaten laufen über ihre eigene TTL ab; hier wird nur der Index
+        aufgeräumt, und das höchstens einmal pro ``TRIM_INTERVAL``.
         """
-        Add country code to the set of unique countries.
-        
-        Implementation detail:
-        - Uses Redis SET to store unique countries
-        - **NO TTL** - set persists indefinitely
-        - Automatically handles duplicates (set property)
-        """
-        if not self.redis_client:
-            raise RuntimeError("Redis client not initialized")
+        now = time.time()
+        if now - self._last_trim < TRIM_INTERVAL:
+            return
+        self._last_trim = now
 
-        # Add country to set (duplicates are ignored)
-        self.redis_client.sadd(UNIQUE_COUNTRIES_SET_KEY, country)
-        logger.debug(f"Added country to unique set: {country}")
+        client = self._client()
+        if client is None:
+            return
+        try:
+            removed = client.zremrangebyscore(ATTACKS_KEY, "-inf", now - TTL_24H)
+            if removed:
+                logger.debug("%s abgelaufene Angriffe aus dem Index entfernt", removed)
+        except Exception as exc:
+            logger.error("Index konnte nicht beschnitten werden: %s", exc)
 
-    def _increment_country_count(self, country: str) -> None:
-        """
-        Increment the count for a country code in the country hash.
+    # ------------------------------------------------------------------
+    # Lesepfad: einzelne Angriffe
+    # ------------------------------------------------------------------
+    def _load_payloads(self, decision_ids: List[str]) -> List[Dict[str, Any]]:
+        """Holt die Nutzdaten zu einer ID-Liste in einem einzigen ``MGET``."""
+        client = self._client()
+        if client is None or not decision_ids:
+            return []
 
-        Implementation detail:
-        - Uses Redis HASH to store country counts: field = country code, value = count
-        - Automatically creates entry if not exists
-        - TTL = 24 hours
-        """
-        if not self.redis_client:
-            raise RuntimeError("Redis client not initialized")
+        try:
+            raw_values = client.mget([_payload_key(i) for i in decision_ids])
+        except Exception as exc:
+            logger.error("Nutzdaten konnten nicht geladen werden: %s", exc)
+            return []
 
-        # Increment the counter for this country
-        self.redis_client.hincrby(COUNTRY_HASH_KEY, country, 1)
-        
-        # Set expiration to 24 hours
-        self.redis_client.expire(COUNTRY_HASH_KEY, 86400)
+        result: List[Dict[str, Any]] = []
+        orphaned: List[str] = []
+
+        for decision_id, raw in zip(decision_ids, raw_values):
+            if raw is None:
+                # Nutzdaten abgelaufen, Index-Eintrag noch vorhanden.
+                orphaned.append(decision_id)
+                continue
+            try:
+                result.append({decision_id: json.loads(raw)})
+            except json.JSONDecodeError:
+                logger.warning("Angriff %s enthält kein gültiges JSON", decision_id)
+                orphaned.append(decision_id)
+
+        if orphaned:
+            try:
+                client.zrem(ATTACKS_KEY, *orphaned)
+            except Exception as exc:
+                logger.debug("Verwaiste Index-Einträge blieben stehen: %s", exc)
+
+        return result
 
     def get_latest_decisions(self, count: int = 20) -> List[Dict[str, Any]]:
+        """Angriffe der letzten ``LIVE_WINDOW`` Sekunden, neueste zuerst.
+
+        Jeder Angriff hat sein eigenes Zeitfenster - es fällt also nicht mehr
+        die gesamte Anzeige auf einmal weg.
         """
-        Get the latest decisions from Redis as array of objects with ID as key.
-
-        Args:
-            count: Number of decisions to return (default 20)
-
-        Returns:
-            List of decision objects in format [{"id": {...}}, {"id2": {...}}]
-        """
-        try:
-            if not self.redis_client:
-                logger.error("Redis client not initialized")
-                return []
-
-            # Get all decisions from hash
-            all_decisions_dict = self.redis_client.hgetall(DECISIONS_HASH_KEY)  # type: ignore[no-untyped-call]
-            
-            if not all_decisions_dict:
-                return []
-
-            # Convert to list of single-key dicts: [{"id": data}, {"id2": data}, ...]
-            result: List[Dict[str, Any]] = []
-            item_count = 0
-            decisions_items = list(all_decisions_dict.items())  # type: ignore[union-attr]
-            for decision_id, decision_json in decisions_items:
-                if item_count >= count:
-                    break
-                try:
-                    decision_data = json.loads(str(decision_json))
-                    result.append({decision_id: decision_data})
-                    item_count += 1
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse decision {decision_id}")
-                    continue
-            
-            return result
-
-        except Exception as e:
-            logger.error(f"Error retrieving decisions from Redis: {e}")
+        client = self._client()
+        if client is None:
             return []
 
-    def _add_to_history(self, decision_id: str, decision_data: Dict[str, Any]) -> None:
-        """
-        Add decision to history sorted set.
-        
-        Implementation detail:
-        - Uses Redis Sorted Set with timestamp as score
-        - Stores decision as JSON with ID as member
-        - TTL = 7 days for history
-        """
-        if not self.redis_client:
-            raise RuntimeError("Redis client not initialized")
-        
+        now = time.time()
         try:
-            import time
-            timestamp = time.time()  # Current timestamp as score
-            
-            # Add to sorted set with timestamp as score
-            self.redis_client.zadd(
-                DECISIONS_HISTORY_LIST_KEY,
-                {f"{decision_id}:{json.dumps(decision_data)}": timestamp}
+            ids = client.zrevrangebyscore(
+                ATTACKS_KEY,
+                "+inf",
+                now - LIVE_WINDOW,
+                start=0,
+                num=max(1, count),
             )
-            
-            # Set expiration to 7 days (604800 seconds)
-            self.redis_client.expire(DECISIONS_HISTORY_LIST_KEY, 604800)
-            logger.debug(f"Added decision {decision_id} to history")
-        except Exception as e:
-            logger.error(f"Failed to add decision to history: {e}")
-            raise
+        except Exception as exc:
+            logger.error("Aktuelle Angriffe konnten nicht gelesen werden: %s", exc)
+            return []
+
+        return self._load_payloads([str(i) for i in ids])
 
     def get_decision_history(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """
-        Get paginated decision history from Redis sorted set.
-        
-        Args:
-            limit: Number of decisions to return (max 1000)
-            offset: Number of decisions to skip
-        
-        Returns:
-            List of decision objects in format [{"id": {...}}, {"id2": {...}}]
-        """
-        try:
-            if not self.redis_client:
-                logger.error("Redis client not initialized")
-                return []
-            
-            # Clamp limit to reasonable value
-            limit = min(limit, 1000)
-            
-            # Get range from sorted set (reversed to get newest first)
-            # ZREVRANGE returns from highest to lowest score
-            history_items: Any = self.redis_client.zrevrange(  # type: ignore[no-untyped-call]
-                DECISIONS_HISTORY_LIST_KEY,
-                offset,
-                offset + limit - 1,
-                withscores=False
-            )
-            
-            if not history_items:
-                return []
-            
-            result: List[Dict[str, Any]] = []
-            for item in history_items:  # type: ignore[union-attr]
-                try:
-                    # Parse the stored format: "id:json_data"
-                    item_str = str(item)
-                    if ":" in item_str:
-                        decision_id, decision_json = item_str.split(":", 1)
-                        decision_data = json.loads(decision_json)
-                        result.append({decision_id: decision_data})
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Failed to parse history item: {e}")
-                    continue
-            
-            return result
-        
-        except Exception as e:
-            logger.error(f"Error retrieving decision history: {e}")
+        """Seitenweiser Verlauf über die letzten 24 Stunden, neueste zuerst."""
+        client = self._client()
+        if client is None:
             return []
 
-    def get_history_count(self) -> int:
-        """Get total number of decisions in history"""
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
+
         try:
-            if not self.redis_client:
-                return 0
-            
-            count: Any = self.redis_client.zcard(DECISIONS_HISTORY_LIST_KEY)  # type: ignore[no-untyped-call]
-            return int(count) if count else 0
-        except Exception as e:
-            logger.error(f"Error getting history count: {e}")
+            ids = client.zrevrange(ATTACKS_KEY, offset, offset + limit - 1)
+        except Exception as exc:
+            logger.error("Verlauf konnte nicht gelesen werden: %s", exc)
+            return []
+
+        return self._load_payloads([str(i) for i in ids])
+
+    def get_history_count(self) -> int:
+        """Anzahl der Angriffe im 24-h-Fenster."""
+        client = self._client()
+        if client is None:
+            return 0
+        try:
+            return int(client.zcard(ATTACKS_KEY))
+        except Exception as exc:
+            logger.error("Verlaufsanzahl konnte nicht ermittelt werden: %s", exc)
             return 0
 
-    def clear_all(self) -> bool:
-        """Clear all data from Redis"""
-        try:
-            if not self.redis_client:
-                return False
-            self.redis_client.delete(
-                DECISIONS_HASH_KEY,
-                COUNTRY_HASH_KEY,
-                TOTAL_ATTACKS_KEY,
-                UNIQUE_COUNTRIES_SET_KEY,
-                DECISIONS_HISTORY_LIST_KEY
-            )
-            logger.info("Cleared all decisions, country counts, and metrics from Redis")
-            return True
-        except Exception as e:
-            logger.error(f"Error clearing Redis: {e}")
-            return False
+    # ------------------------------------------------------------------
+    # Lesepfad: Aggregate
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _recent_hours(now: Optional[float] = None) -> List[int]:
+        """Die ``WINDOW_HOURS`` Stunden bis einschließlich der laufenden."""
+        current = _hour_of(now if now is not None else time.time())
+        return [current - offset for offset in range(WINDOW_HOURS - 1, -1, -1)]
 
-    def get_decisions_by_country(self):
+    def _country_totals(self) -> List[Tuple[str, int]]:
+        """Ländervereinigung über die Stundeneimer, absteigend sortiert.
+
+        ``ZUNIONSTORE`` rechnet im Server; übertragen wird nur das Ergebnis.
+        Das Zwischenergebnis wird kurz zwischengespeichert, damit häufige
+        Abfragen die Vereinigung nicht jedes Mal neu bilden.
         """
-        Get aggregated country counts from Redis hash with metadata.
+        client = self._client()
+        if client is None:
+            return []
 
-        Returns:
-            Dict with status, metadata (total_attacks, unique_countries, attacks_per_hour), 
-            and countries list sorted by count (descending)
-        """
         try:
-            if not self.redis_client:
-                logger.error("Redis client not initialized")
-                return {
-                    "status": "error",
-                    "message": "Redis client not initialized",
-                }
+            if not client.exists(COUNTRIES_CACHE_KEY):
+                keys = [_countries_key(hour) for hour in self._recent_hours()]
+                pipe = client.pipeline(transaction=False)
+                pipe.zunionstore(COUNTRIES_CACHE_KEY, keys)
+                pipe.expire(COUNTRIES_CACHE_KEY, COUNTRIES_CACHE_TTL)
+                pipe.execute()
 
-            # Get all country counts from hash
-            country_counts = self.redis_client.hgetall(COUNTRY_HASH_KEY)  # type: ignore[no-untyped-call]
-            
-            # Get persistent metrics
-            total_attacks = 0
-            total_attacks_str = self.redis_client.get(TOTAL_ATTACKS_KEY)  # type: ignore[no-untyped-call]
-            if total_attacks_str:
-                try:
-                    total_attacks = int(str(total_attacks_str))
-                except (ValueError, TypeError):
-                    total_attacks = 0
-            
-            unique_countries = 0
-            unique_countries_set = self.redis_client.smembers(UNIQUE_COUNTRIES_SET_KEY)  # type: ignore[no-untyped-call]
-            if unique_countries_set:
-                try:
-                    unique_countries = len(list(unique_countries_set))  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    unique_countries = 0
-            
-            # Calculate attacks per hour (total / 24)
-            attacks_per_hour = total_attacks // 24 if total_attacks > 0 else 0
-            
-            # Build metadata
-            metadata = {
-                "total_attacks": total_attacks,
-                "unique_countries": unique_countries,
-                "attacks_per_hour": attacks_per_hour,
-            }
-            
-            if not country_counts:
-                return {
-                    "status": "success",
-                    "metadata": metadata,
-                    "countries": []
-                }
+            entries = client.zrevrange(COUNTRIES_CACHE_KEY, 0, -1, withscores=True)
+        except Exception as exc:
+            logger.error("Länderstatistik konnte nicht gebildet werden: %s", exc)
+            return []
 
-            # Convert to list of {"country_code": count} dicts and sort by count descending
-            countries_list = []
-            items_list = list(country_counts.items())  # type: ignore[union-attr]
-            for country, count_str in items_list:
-                try:
-                    count = int(count_str)
-                    countries_list.append({country: count})
-                except (ValueError, TypeError):
-                    logger.warning(f"Invalid count for country {country}: {count_str}")
-                    continue
-            
-            # Sort by count (value) in descending order
-            countries_list.sort(key=lambda x: list(x.values())[0], reverse=True)
+        return [(str(country), int(score)) for country, score in entries]
 
+    def _count_since(self, seconds: int) -> int:
+        """Anzahl der Angriffe der letzten ``seconds`` Sekunden."""
+        client = self._client()
+        if client is None:
+            return 0
+        try:
+            return int(client.zcount(ATTACKS_KEY, time.time() - seconds, "+inf"))
+        except Exception as exc:
+            logger.error("Angriffe konnten nicht gezählt werden: %s", exc)
+            return 0
+
+    def get_total_attacks_24h(self) -> int:
+        return self._count_since(TTL_24H)
+
+    def get_attacks_last_hour(self) -> int:
+        return self._count_since(HOUR)
+
+    def get_unique_countries_24h(self) -> int:
+        return len(self._country_totals())
+
+    def get_country_counts_24h(self) -> Dict[str, int]:
+        return dict(self._country_totals())
+
+    def get_decisions_by_country(self) -> Dict[str, Any]:
+        """Antwort für ``GET /api/v1/country``.
+
+        ``attacks_per_hour`` ist die tatsächliche Anzahl der letzten 60 Minuten
+        und damit die aktuelle Rate - nicht mehr der 24-h-Durchschnitt.
+        """
+        client = self._client()
+        if client is None:
+            return {"status": "error", "message": "Redis client not initialized"}
+
+        try:
+            countries = self._country_totals()
             return {
                 "status": "success",
-                "metadata": metadata,
-                "countries": countries_list
+                "metadata": {
+                    "total_attacks": self.get_total_attacks_24h(),
+                    "unique_countries": len(countries),
+                    "attacks_per_hour": self.get_attacks_last_hour(),
+                },
+                "countries": [{country: count} for country, count in countries],
             }
+        except Exception as exc:
+            logger.error("Länderabfrage fehlgeschlagen: %s", exc)
+            return {"status": "error", "message": "An internal error occurred"}
 
-        except Exception as e:
-            logger.error(f"Error aggregating decisions by country: {e}")
-            return {
-                "status": "error",
-                "message": "An internal error occurred"
-            }
+    def get_timeline_24h(self) -> List[Dict[str, Any]]:
+        """Angriffe je Stunde für die letzten 24 Stunden, älteste zuerst.
+
+        Liest die vorberechneten Stundenzähler - ein ``MGET`` statt tausender
+        Einzelereignisse.
+        """
+        client = self._client()
+        if client is None:
+            return []
+
+        hours = self._recent_hours()
+        try:
+            values = client.mget([_total_key(hour) for hour in hours])
+        except Exception as exc:
+            logger.error("Zeitverlauf konnte nicht gelesen werden: %s", exc)
+            return []
+
+        current_hour = hours[-1]
+        timeline: List[Dict[str, Any]] = []
+        for hour, raw in zip(hours, values):
+            try:
+                count = int(raw) if raw is not None else 0
+            except (TypeError, ValueError):
+                count = 0
+            timeline.append(
+                {
+                    "hour_start": self._iso_hour(hour),
+                    "hours_ago": current_hour - hour,
+                    "count": count,
+                }
+            )
+        return timeline
+
+    @staticmethod
+    def _iso_hour(hour: int) -> str:
+        return datetime.fromtimestamp(hour * HOUR, settings.tz).isoformat()
+
+    # ------------------------------------------------------------------
+    # Wartung
+    # ------------------------------------------------------------------
+    def clear_all(self) -> bool:
+        """Löscht alle Daten des Dashboards, einschließlich alter Schlüssel."""
+        client = self._client()
+        if client is None:
+            return False
+
+        try:
+            keys = [ATTACKS_KEY, COUNTRIES_CACHE_KEY, *LEGACY_KEYS]
+            for hour in self._recent_hours():
+                keys.append(_countries_key(hour))
+                keys.append(_total_key(hour))
+
+            pipe = client.pipeline(transaction=False)
+            pipe.delete(*keys)
+            # Nutzdaten laufen zwar von allein ab, werden hier aber sofort entfernt.
+            for batch in self._scan_payload_keys(client):
+                pipe.delete(*batch)
+            pipe.execute()
+
+            logger.info("Alle Dashboard-Daten aus Redis entfernt")
+            return True
+        except Exception as exc:
+            logger.error("Aufräumen fehlgeschlagen: %s", exc)
+            return False
+
+    @staticmethod
+    def _scan_payload_keys(
+        client: redis.Redis, batch_size: int = 500
+    ) -> Iterator[List[str]]:
+        """Iteriert die Nutzdaten-Schlüssel per ``SCAN`` statt per ``KEYS``."""
+        batch: List[str] = []
+        for key in client.scan_iter(match=f"{ATTACK_PAYLOAD_PREFIX}*", count=batch_size):
+            batch.append(str(key))
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
 
-# Global Redis client instance
 _redis_client: Optional[RedisClient] = None
 
 
 def get_redis_client() -> RedisClient:
-    """Get or create Redis client"""
+    """Liefert die gemeinsam genutzte Redis-Client-Instanz."""
     global _redis_client
     if _redis_client is None:
         _redis_client = RedisClient()

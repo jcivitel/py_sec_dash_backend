@@ -1,9 +1,9 @@
 """CrowdSec API Client with stream listener"""
 
 import logging
+import time
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
-from datetime import datetime as _datetime_type
+from typing import Any, Dict, List, Optional
 
 import requests
 from requests.exceptions import RequestException, Timeout
@@ -14,14 +14,25 @@ from app.redis_client import get_redis_client
 logger = logging.getLogger(__name__)
 
 
+#: Abstand zwischen zwei Abfragen der Alert-Liste.
+POLL_INTERVAL = 1.25
+#: Wartezeit nach einem Fehler, bevor erneut versucht wird.
+ERROR_BACKOFF = 5
+#: So viele Alerts werden pro Abfrage geholt.
+ALERT_PAGE_SIZE = 10
+
+
 class CrowdSecClient:
     """Client for interacting with CrowdSec API"""
 
-    API_KEY: str = ""
-    KEY_RENEWAL_AT: Optional[_datetime_type] = None
-    last_decision_id: Optional[str] = None
-
     def __init__(self):
+        # Zustand gehört an die Instanz - als Klassenattribute würden ihn
+        # mehrere Clients unbemerkt teilen.
+        self.API_KEY: str = ""
+        self.KEY_RENEWAL_AT: Optional[datetime] = None
+        self.last_decision_id: Optional[int] = None
+        self._last_renewal_print: Optional[datetime] = None
+
         self.base_url = settings.crowdsec_host.rstrip("/")
         self.tls_cert = str(settings.tls_cert_path)
         self.tls_key = str(settings.tls_key_path)
@@ -145,9 +156,13 @@ class CrowdSecClient:
 
             self.KEY_RENEWAL_AT = expire_dt.astimezone(settings.tz).replace(microsecond=0)
             self.API_KEY = response_data.get("token", "")
-            logger.info(f"Obtained API key for decision stream: {self.API_KEY}")
+            # Das Token ist ein Geheimnis und gehört nicht ins Log.
+            logger.info("Obtained API key for decision stream")
 
-        url = f"{self.base_url}/v1/alerts?simulated=false&has_active_decision=true&limit=10"
+        url = (
+            f"{self.base_url}/v1/alerts"
+            f"?simulated=false&has_active_decision=true&limit={ALERT_PAGE_SIZE}"
+        )
         headers = self._get_headers()
         redis_client = get_redis_client()
 
@@ -158,7 +173,7 @@ class CrowdSecClient:
         logger.info(f"Starting CrowdSec decision stream from {url}")
         while True:
             now = datetime.now(settings.tz)
-            if getattr(self, "_last_renewal_print", None) is None or now - self._last_renewal_print >= timedelta(
+            if self._last_renewal_print is None or now - self._last_renewal_print >= timedelta(
                 minutes=5
             ):
                 if self.KEY_RENEWAL_AT:
@@ -168,6 +183,10 @@ class CrowdSecClient:
             if self.KEY_RENEWAL_AT and now >= (self.KEY_RENEWAL_AT - timedelta(minutes=5)):
                 logger.info("Renewing API key for decision stream")
                 get_apikey()
+                if not self.API_KEY:
+                    # Ohne Wartezeit würde ein fehlgeschlagener Login die
+                    # Schleife ohne Pause durchlaufen lassen.
+                    time.sleep(ERROR_BACKOFF)
                 continue
             try:
                 headers = self._get_headers()  # Refresh headers with current API_KEY
@@ -175,37 +194,83 @@ class CrowdSecClient:
 
                 if response is None:
                     logger.error(
-                        "Failed to connect to decisions stream, retrying in 5 seconds..."
+                        "Failed to connect to decisions stream, retrying in %ss...",
+                        ERROR_BACKOFF,
                     )
-                    import time
-
-                    time.sleep(5)
+                    time.sleep(ERROR_BACKOFF)
                     continue
-                
-                json_data = response.json()
-                if not self.last_decision_id == json_data[0]["id"]:
-                    self.last_decision_id = json_data[0]["id"]
-                    # Get current timestamp in ISO format
-                    timestamp = datetime.now(settings.tz).isoformat()
-                    data = {
-                        "latitude": json_data[0]["source"]["latitude"],
-                        "longitude": json_data[0]["source"]["longitude"],
-                        "cn": json_data[0]["source"]["cn"],
-                        "timestamp": timestamp,
-                    }
-                    # Use CrowdSec decision ID as unique identifier
-                    redis_client.add_decision(data, str(json_data[0]["id"]))
-                    logger.info("Added new decision")
-                else:
-                    import time
 
-                    time.sleep(1.25)
+                stored = self._store_new_alerts(response.json(), redis_client)
+                if stored:
+                    logger.info("Stored %s new decision(s)", stored)
+
+                time.sleep(POLL_INTERVAL)
 
             except Exception as e:
                 logger.error(f"Error in decision stream: {type(e).__name__}: {e}")
-                import time
+                time.sleep(ERROR_BACKOFF)
 
-                time.sleep(5)
+    def _store_new_alerts(self, alerts: Any, redis_client: Any) -> int:
+        """Speichert alle Alerts, die neuer sind als der zuletzt gesehene.
+
+        Bisher wurde nur ``alerts[0]`` betrachtet. Trafen zwischen zwei
+        Abfragen mehrere Alerts ein, gingen alle bis auf den neuesten
+        verloren. Die Liste kommt absteigend nach ID, wird hier aber
+        aufsteigend verarbeitet, damit die Reihenfolge im Verlauf stimmt.
+        """
+        if not isinstance(alerts, list) or not alerts:
+            return 0
+
+        fresh: List[Dict[str, Any]] = []
+        for alert in alerts:
+            alert_id = self._alert_id(alert)
+            if alert_id is None:
+                continue
+            if self.last_decision_id is not None and alert_id <= self.last_decision_id:
+                continue
+            fresh.append(alert)
+
+        if not fresh:
+            return 0
+
+        fresh.sort(key=lambda item: self._alert_id(item) or 0)
+
+        stored = 0
+        for alert in fresh:
+            alert_id = self._alert_id(alert)
+            source = alert.get("source") or {}
+            latitude = source.get("latitude")
+            longitude = source.get("longitude")
+            if latitude is None or longitude is None:
+                logger.debug("Alert %s ohne Koordinaten, übersprungen", alert_id)
+                continue
+
+            data = {
+                "latitude": latitude,
+                "longitude": longitude,
+                "cn": source.get("cn", ""),
+                "timestamp": datetime.now(settings.tz).isoformat(),
+            }
+            if redis_client.add_decision(data, str(alert_id)):
+                stored += 1
+
+        # Auch übersprungene Alerts gelten als gesehen, sonst werden sie bei
+        # jeder Abfrage erneut geprüft.
+        newest = self._alert_id(fresh[-1])
+        if newest is not None:
+            self.last_decision_id = newest
+
+        return stored
+
+    @staticmethod
+    def _alert_id(alert: Any) -> Optional[int]:
+        """CrowdSec-Alert-IDs sind aufsteigende Ganzzahlen."""
+        if not isinstance(alert, dict):
+            return None
+        try:
+            return int(alert["id"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
 
 # Create global client instance
