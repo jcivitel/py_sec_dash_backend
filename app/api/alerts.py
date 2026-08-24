@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 @router.get("/decisions")
 async def get_latest_decisions():
     """
-    Get the latest decisions from Redis.
-    
+    Get the currently running attacks (last 20 seconds).
+
     Returns decisions as a list of dictionaries where each decision has its unique ID as a key.
     Format: [{"unique_decision_id_1": {...}}, {"unique_decision_id_2": {...}}]
     

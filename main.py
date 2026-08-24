@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
 # Import routers
-from app.api import alerts, health, country
+from app.api import alerts, health, country, stats
 
 # Stream listener thread reference
 stream_thread = None
@@ -98,6 +98,7 @@ app.add_middleware(
 app.include_router(health.router, prefix="/api/v1", tags=["health"])
 app.include_router(alerts.router, prefix="/api/v1", tags=["decisions"])
 app.include_router(country.router, prefix="/api/v1", tags=["country"])
+app.include_router(stats.router, prefix="/api/v1", tags=["stats"])
 
 
 @app.get("/")
