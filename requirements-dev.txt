@@ -1,5 +1,5 @@
 -r requirements.txt
 
 # Nur für Tests und lokale Entwicklung
-pytest==9.1.0
+pytest==9.1.1
 httpx==0.29.0
